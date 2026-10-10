@@ -36,7 +36,13 @@
     "directory_unreadable": "Directory unavailable",
     "directory_empty": "No supported wallpapers in this directory",
     "no_search_results": "No wallpapers match your search",
-    "page": "{page} / {pages}"
+    "page": "{page} / {pages}",
+    "slideshow": "Slideshow",
+    "slideshow_off": "Off",
+    "slideshow_mixed": "Mixed",
+    "minutes": "{n} min",
+    "hours": "{n} h",
+    "shuffle": "Shuffle"
   },
   "widget": {
     "tooltip": "Choose wallpaper"

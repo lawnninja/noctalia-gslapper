@@ -21,6 +21,8 @@ local capabilities = noctalia.state.get("capabilities") or { video = false, chec
 local outputs = noctalia.state.get("outputs") or {}
 local commandResult = noctalia.state.get("command_result")
 local selectedOutput = "*"
+local slideshow = noctalia.state.get("slideshow") or {}
+local SLIDESHOW_PRESETS = { 0, 60, 300, 600, 900, 1800, 3600, 10800 }
 local nonceCounter = 0
 local outputOptions = {}
 local folderEntries = {}
@@ -416,7 +418,7 @@ local function nextNonce()
     return noctalia.nowMs() * 1000 + nonceCounter
 end
 
-local function sendCommand(action, entry)
+local function sendCommand(action, entry, extra)
     local command = {
         nonce = nextNonce(),
         action = action,
@@ -425,6 +427,9 @@ local function sendCommand(action, entry)
     if entry then
         command.path = entry.path
         command.preview_path = entry.thumbnail and noctalia.fileExists(entry.thumbnail) and entry.thumbnail or nil
+    end
+    if extra then
+        for k, v in pairs(extra) do command[k] = v end
     end
     noctalia.state.set("command", command)
 end
@@ -632,6 +637,106 @@ local function folderStrip(directories)
     })
 end
 
+local function formatInterval(sec)
+    if sec == 0 then return tr("panel.slideshow_off") end
+    if sec < 3600 then return tr("panel.minutes", { n = math.floor(sec / 60) }) end
+    return tr("panel.hours", { n = math.floor(sec / 3600) })
+end
+
+function onSlideshowChanged(index, label)
+    local selectedConnectors = selectedOutput == "*" and connectorNames() or { selectedOutput }
+    local hasMixed = false
+    local firstInterval = nil
+    for _, c in ipairs(selectedConnectors) do
+        local cInterval = (slideshow[c] or {}).interval_sec or 0
+        if firstInterval == nil then firstInterval = cInterval
+        elseif firstInterval ~= cInterval then hasMixed = true end
+    end
+    
+    local targetInterval
+    if hasMixed then
+        if index == 0 then return end
+        targetInterval = SLIDESHOW_PRESETS[index]
+    else
+        targetInterval = SLIDESHOW_PRESETS[index + 1]
+    end
+    
+    if targetInterval == nil then return end
+
+    if not hasMixed and firstInterval == targetInterval then
+        return
+    end
+
+    local shuffle = false
+    for _, c in ipairs(selectedConnectors) do
+        if (slideshow[c] or {}).shuffle then shuffle = true break end
+    end
+    
+    sendCommand("set-slideshow", nil, { interval_sec = targetInterval, shuffle = shuffle })
+end
+
+function onSlideshowShuffle()
+    local selectedConnectors = selectedOutput == "*" and connectorNames() or { selectedOutput }
+    local shuffle = false
+    for _, c in ipairs(selectedConnectors) do
+        if (slideshow[c] or {}).shuffle then shuffle = true break end
+    end
+    
+    local interval_sec = 0
+    for _, c in ipairs(selectedConnectors) do
+        local cInterval = (slideshow[c] or {}).interval_sec or 0
+        if cInterval > 0 then
+            interval_sec = cInterval
+            break
+        end
+    end
+    if interval_sec == 0 then interval_sec = 60 end
+    
+    sendCommand("set-slideshow", nil, { interval_sec = interval_sec, shuffle = not shuffle })
+end
+
+local function slideshowStrip(connectors)
+    if #connectors == 0 then return nil end
+    local hasAssignment = false
+    for _, c in ipairs(connectors) do
+        if assignments[c] then hasAssignment = true break end
+    end
+    
+    local firstInterval = nil
+    local hasMixed = false
+    local shuffle = true
+    for _, c in ipairs(connectors) do
+        local entry = slideshow[c] or {}
+        local cInterval = entry.interval_sec or 0
+        if firstInterval == nil then firstInterval = cInterval
+        elseif firstInterval ~= cInterval then hasMixed = true end
+        if not entry.shuffle then shuffle = false end
+    end
+    
+    local options = {}
+    local selectedIndex = 0
+    if hasMixed then
+        table.insert(options, tr("panel.slideshow_mixed"))
+        for _, sec in ipairs(SLIDESHOW_PRESETS) do
+            table.insert(options, formatInterval(sec))
+        end
+    else
+        for i, sec in ipairs(SLIDESHOW_PRESETS) do
+            table.insert(options, formatInterval(sec))
+            if sec == firstInterval then selectedIndex = i - 1 end
+        end
+    end
+
+    return ui.row({ align="center", gap=8, padding=9, radius=9, fill="surface_variant/0.40" }, {
+        ui.glyph({ name="clock-play", color="primary", size=18 }),
+        ui.label({ text=tr("panel.slideshow"), flexGrow=1 }),
+        ui.button({ glyph="arrows-shuffle", variant="ghost", selected=shuffle,
+                    tooltip=tr("panel.shuffle"), enabled=hasAssignment, onClick="onSlideshowShuffle" }),
+        ui.select({ options=options, selectedIndex=selectedIndex, width=170,
+                    enabled=hasAssignment, onChange="onSlideshowChanged" }),
+    })
+end
+
 local function activeStrip(connectors)
     if selectedOutput == "*" then
         local counts = mixedCounts(assignments, connectors)
@@ -804,6 +909,8 @@ render = function()
     end
     local active = activeStrip(connectors)
     if active then table.insert(children, active) end
+    local slide = slideshowStrip(connectors)
+    if slide then table.insert(children, slide) end
     local result = resultBanner()
     if result then table.insert(children, result) end
 
@@ -870,6 +977,7 @@ end
 
 function onOpen(_context)
     outputs = noctalia.state.get("outputs") or noctalia.outputs() or {}
+    slideshow = noctalia.state.get("slideshow") or {}
     assignments = noctalia.state.get("assignments") or {}
     runtime = noctalia.state.get("runtime") or {}
     capabilities = noctalia.state.get("capabilities") or capabilities
@@ -950,6 +1058,10 @@ end
 noctalia.state.watch("assignments", function(value)
     assignments = type(value) == "table" and value or {}
     invalidateGrid()
+    render()
+end)
+noctalia.state.watch("slideshow", function(value)
+    slideshow = type(value) == "table" and value or {}
     render()
 end)
 noctalia.state.watch("runtime", function(value)
