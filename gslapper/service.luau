@@ -1422,10 +1422,9 @@ local function assignVideo(connector, path, previewPath, desiredPlayback)
         end
     end
 
+    launchSequence()
+
     if not (cachedStill and noctalia.fileExists(cachedStill)) then
-        local live = runtime[connector]
-        runtime[connector] = { status = "starting", socket_path = live and live.socket_path }
-        publishRuntime()
         ensureStill(validPath, function(stillFile)
             if not isCurrent(connector, generation) or videoTarget[connector] ~= validPath then
                 return
@@ -1440,14 +1439,7 @@ local function assignVideo(connector, path, previewPath, desiredPlayback)
                     publishAssignments()
                 end
             end
-            noctalia.runAsync("sleep 0.5", function()
-                launchSequence()
-            end, 2000)
         end)
-    else
-        noctalia.runAsync("sleep 0.5", function()
-            launchSequence()
-        end, 2000)
     end
     return true
 end
