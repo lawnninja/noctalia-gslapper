@@ -1440,10 +1440,14 @@ local function assignVideo(connector, path, previewPath, desiredPlayback)
                     publishAssignments()
                 end
             end
-            launchSequence()
+            noctalia.runAsync("sleep 0.5", function()
+                launchSequence()
+            end, 2000)
         end)
     else
-        launchSequence()
+        noctalia.runAsync("sleep 0.5", function()
+            launchSequence()
+        end, 2000)
     end
     return true
 end
