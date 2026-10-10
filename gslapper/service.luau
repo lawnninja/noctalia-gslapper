@@ -10,9 +10,19 @@ local lastHandledNonce = 0
 local commandBatches = {}
 local activeRequests = {}
 local restartSettingsSignature = ""
+local SLIDESHOW_INTERVALS = {
+    [0] = true, [60] = true, [300] = true, [600] = true,
+    [900] = true, [1800] = true, [3600] = true, [10800] = true,
+}
+local slideshow = {}
+local slideshowNextAt = {}
+local siblingCache = { version = -1, dirs = {} }
 local NOTIFICATION_TITLE = "gSlapper"
 local IMAGE_EXTENSIONS = { jpg = true, jpeg = true, png = true, webp = true, jxl = true, bmp = true }
 local VIDEO_EXTENSIONS = { mp4 = true, mkv = true, webm = true, mov = true, avi = true, m4v = true, gif = true }
+local STILL_PREFIX = "s1:"
+local stillJobs = {}
+local videoTarget = {}
 local LIBRARY_BATCH_SIZE = 6
 local THUMBNAIL_LIMIT = 2
 local libraryGeneration = 0
@@ -130,6 +140,66 @@ local function thumbnailPath(path, size, mtime)
         return nil
     end
     return directory .. "/thumb-" .. fnv1a32("v3:" .. path .. ":" .. tostring(size) .. ":" .. tostring(mtime)) .. ".jpg"
+end
+
+local function stillPathFor(videoPath)
+    local directory = noctalia.pluginDataDir()
+    if not directory or type(videoPath) ~= "string" or videoPath == "" then
+        return nil
+    end
+    local info = noctalia.fileInfo(videoPath)
+    local size = (info and info.size) or 0
+    local mtime = (info and info.mtime) or 0
+    return directory .. "/still-" .. fnv1a32(STILL_PREFIX .. videoPath .. ":" .. tostring(size) .. ":" .. tostring(mtime)) .. ".jpg"
+end
+
+local function stillCommand(videoPath, temporaryPath)
+    return "gst-launch-1.0 -q filesrc location=" .. shellQuote(videoPath)
+        .. " ! decodebin ! videoconvert"
+        .. " ! jpegenc quality=95 snapshot=true ! multifilesink location=" .. shellQuote(temporaryPath)
+end
+
+local function ensureStill(videoPath, onReady)
+    local target = stillPathFor(videoPath)
+    if not target then
+        onReady(nil)
+        return
+    end
+    if noctalia.fileExists(target) then
+        onReady(target)
+        return
+    end
+
+    if stillJobs[target] then
+        table.insert(stillJobs[target], onReady)
+        return
+    end
+    stillJobs[target] = { onReady }
+
+    local temporary = target .. ".tmp-" .. tostring(noctalia.nowMs())
+    local command = stillCommand(videoPath, temporary)
+    local started = noctalia.runAsync(command, function(result)
+        local callbacks = stillJobs[target] or {}
+        stillJobs[target] = nil
+        local finalPath = nil
+        if result.exitCode == 0 and noctalia.fileExists(temporary) and noctalia.renameFile(temporary, target) then
+            finalPath = target
+        else
+            noctalia.removeFile(temporary)
+        end
+        for _, cb in ipairs(callbacks) do
+            cb(finalPath)
+        end
+    end, 20000)
+
+    if not started then
+        local callbacks = stillJobs[target] or {}
+        stillJobs[target] = nil
+        noctalia.removeFile(temporary)
+        for _, cb in ipairs(callbacks) do
+            cb(nil)
+        end
+    end
 end
 
 local function publishLibraryStatus(phase, errorMessage)
@@ -258,7 +328,7 @@ startThumbnailJobs = function(generation)
         local command = "gst-launch-1.0 -q filesrc location=" .. shellQuote(entry.path)
             .. " ! decodebin ! videoconvert ! videoscale"
             .. " ! video/x-raw,width=224,height=126,pixel-aspect-ratio=1/1"
-            .. " ! jpegenc quality=80 snapshot=true ! filesink location=" .. shellQuote(temporary)
+            .. " ! jpegenc quality=80 snapshot=true ! multifilesink location=" .. shellQuote(temporary)
         local started = noctalia.runAsync(command, function(result)
             if generation ~= libraryGeneration then
                 noctalia.removeFile(temporary)
@@ -445,11 +515,13 @@ end
 local COMMAND_ACTIONS = {
     ["assign-image"] = true,
     ["assign-video"] = true,
+    ["next"] = true,
     ["pause"] = true,
     ["resume"] = true,
     ["restore"] = true,
     ["restore-all"] = true,
     ["self-test"] = true,
+    ["set-slideshow"] = true,
 }
 
 local function validateCommand(command)
@@ -461,6 +533,11 @@ local function validateCommand(command)
     end
     if type(command.target) ~= "string" or command.target == "" then
         return false, "command target is required"
+    end
+    if command.action == "set-slideshow" then
+        if not SLIDESHOW_INTERVALS[command.interval_sec] or type(command.shuffle) ~= "boolean" then
+            return false, "slideshow interval or shuffle is invalid"
+        end
     end
     if command.action == "assign-image" or command.action == "assign-video" then
         if type(command.path) ~= "string" or command.path:sub(1, 1) ~= "/" or command.path == "/"
@@ -498,6 +575,15 @@ end
 
 local function commandTargets(action, target, connectors, durable)
     local targets = targetsFor(target, connectors)
+    if action == "next" and target == "*" then
+        local assigned = {}
+        for _, connector in ipairs(targets) do
+            if durable[connector] then
+                table.insert(assigned, connector)
+            end
+        end
+        return assigned
+    end
     if (action ~= "pause" and action ~= "resume") or target ~= "*" then
         return targets
     end
@@ -706,6 +792,174 @@ local function saveAssignments()
         return false, renameError or "could not replace assignments"
     end
     return true
+end
+
+local function pruneStills(activeAssignments)
+    local directory = noctalia.pluginDataDir()
+    if not directory or type(noctalia.listDir) ~= "function" then
+        return
+    end
+    local files = noctalia.listDir(directory)
+    if type(files) ~= "table" then
+        return
+    end
+
+    local referenced = {}
+    for _, assignment in pairs(activeAssignments or {}) do
+        if assignment.preview_path then
+            referenced[assignment.preview_path] = true
+        end
+    end
+
+    for _, filename in ipairs(files) do
+        local path = directory .. "/" .. filename
+        if filename:match("^still%-[0-9a-f]+%.jpg$") then
+            if not referenced[path] then
+                noctalia.removeFile(path)
+            end
+        elseif filename:match("^still%-[0-9a-f]+%.jpg%.tmp") then
+            noctalia.removeFile(path)
+        end
+    end
+end
+
+local function slideshowPath()
+    local directory = noctalia.pluginDataDir()
+    if not directory then
+        return nil
+    end
+    return directory .. "/slideshow.json"
+end
+
+local function loadSlideshow()
+    local path = slideshowPath()
+    local contents = path and noctalia.readFile(path)
+    if not contents then
+        return {}
+    end
+    local decoded = noctalia.json.decode(contents)
+    if type(decoded) ~= "table" or type(decoded.outputs) ~= "table" then
+        return {}
+    end
+    local loaded = {}
+    for connector, record in pairs(decoded.outputs) do
+        if type(connector) == "string" and type(record) == "table"
+            and SLIDESHOW_INTERVALS[record.interval_sec] and record.interval_sec > 0
+            and type(record.shuffle) == "boolean" then
+            loaded[connector] = { interval_sec = record.interval_sec, shuffle = record.shuffle }
+        end
+    end
+    return loaded
+end
+
+local function saveSlideshow()
+    local path = slideshowPath()
+    if not path then
+        return false, "plugin data directory is unavailable"
+    end
+    local encoded, encodeError = noctalia.json.encode({ version = 1, outputs = slideshow }, true)
+    if not encoded then
+        return false, encodeError or "could not encode slideshow"
+    end
+    local temporaryPath = path .. ".tmp"
+    local written, writeError = noctalia.writeFile(temporaryPath, encoded)
+    if not written then
+        return false, writeError or "could not write slideshow"
+    end
+    local renamed, renameError = noctalia.renameFile(temporaryPath, path)
+    if not renamed then
+        noctalia.removeFile(temporaryPath)
+        return false, renameError or "could not replace slideshow"
+    end
+    return true
+end
+
+local function publishSlideshow()
+    noctalia.state.set("slideshow", slideshow)
+end
+
+local function sortSlides(list)
+    table.sort(list, function(left, right)
+        return left.key < right.key
+    end)
+end
+
+-- Files of one kind that live directly in the same folder as `path`, from the library index.
+local function mediaSiblings(path, kind)
+    local directory = path:match("^(.*)/[^/]+$")
+    if not directory then
+        return {}
+    end
+    if siblingCache.version ~= libraryVersion then
+        siblingCache = { version = libraryVersion, dirs = {} }
+    end
+    local cacheKey = kind .. "\0" .. directory
+    if siblingCache.dirs[cacheKey] then
+        return siblingCache.dirs[cacheKey]
+    end
+
+    local list = {}
+    local seen = {}
+    for _, source in ipairs(librarySources) do
+        local raw = noctalia.readFile(source.path)
+        if type(raw) == "string" then
+            local offset = 1
+            local len = #raw
+            while offset <= len do
+                local fileType
+                fileType, offset = nextNulField(raw, offset)
+                if not fileType then
+                    break
+                end
+                local size, mtime, entryPath
+                size, offset = nextNulField(raw, offset)
+                mtime, offset = nextNulField(raw, offset)
+                entryPath, offset = nextNulField(raw, offset)
+                if fileType == "f" and entryPath and not seen[entryPath] then
+                    local parent = entryPath:match("^(.*)/[^/]+$")
+                    if parent == directory then
+                        local name = entryPath:match("([^/]+)$")
+                        local entryKind = classifyMedia(name)
+                        if entryKind == kind then
+                            seen[entryPath] = true
+                            table.insert(list, {
+                                path = entryPath,
+                                key = name and name:lower() or entryPath:lower(),
+                            })
+                        end
+                    end
+                end
+            end
+        end
+    end
+    sortSlides(list)
+    siblingCache.dirs[cacheKey] = list
+    return list
+end
+
+local function nextSlide(list, currentPath, shuffle, random)
+    if #list == 0 then
+        return nil
+    end
+    local index = 0
+    for position, item in ipairs(list) do
+        if item.path == currentPath then
+            index = position
+            break
+        end
+    end
+    if shuffle and #list > 1 then
+        local rng = random or math.random
+        if index == 0 then
+            return list[rng(#list)]
+        end
+        local pick = rng(#list - 1)
+        if pick >= index then
+            pick = pick + 1
+        end
+        return list[pick]
+    end
+    return list[(index % #list) + 1]
 end
 
 local function publishRuntime()
@@ -948,7 +1202,6 @@ local function commitVideo(connector, generation, assignment, query)
     end
 
     clearPending(connector)
-    noctalia.setWallpaperEnabled(connector, false)
     runtime[connector] = {
         status = query.status,
         error = nil,
@@ -1115,49 +1368,84 @@ local function assignVideo(connector, path, previewPath, desiredPlayback)
         return false, capabilities.error or "video support is unavailable"
     end
 
+    videoTarget[connector] = validPath
+    local cachedStill = stillPathFor(validPath)
+    local initialStill = (cachedStill and noctalia.fileExists(cachedStill)) and cachedStill or previewPath
+
     local generation = nextGeneration(connector)
     local assignment = {
         kind = "video",
         path = validPath,
-        preview_path = previewPath,
+        preview_path = initialStill,
         desired_playback = desiredPlayback == "paused" and "paused" or "playing",
     }
-    if previewPath then
-        noctalia.setWallpaper(connector, previewPath)
+    
+    noctalia.setWallpaperEnabled(connector, true)
+    if initialStill then
+        noctalia.setWallpaper(connector, initialStill)
     end
 
-    local directory = runtimeDirectory()
-    local socketPath = directory and socketPathFor(connector, directory)
-    if socketPath and noctalia.fileExists(socketPath) then
-        runtime[connector] = { status = "starting", socket_path = socketPath }
-        publishRuntime()
-        ipcCommand(socketPath, "query", function(query)
-            if not isCurrent(connector, generation) then
-                return
-            end
-            if query.ok and query.kind == "video" and query.path == assignment.path then
-                commitVideo(connector, generation, assignment, query)
-            elseif query.ok then
-                changeVideo(connector, generation, assignment, socketPath)
-            elseif query.notConnectable then
-                if isOwnedSocket(socketPath, directory) then
-                    noctalia.removeFile(socketPath)
+    local function launchSequence()
+        if not isCurrent(connector, generation) or videoTarget[connector] ~= validPath then
+            return
+        end
+        local directory = runtimeDirectory()
+        local socketPath = directory and socketPathFor(connector, directory)
+        if socketPath and noctalia.fileExists(socketPath) then
+            runtime[connector] = { status = "starting", socket_path = socketPath }
+            publishRuntime()
+            ipcCommand(socketPath, "query", function(query)
+                if not isCurrent(connector, generation) then
+                    return
                 end
+                if query.ok and query.kind == "video" and query.path == assignment.path then
+                    commitVideo(connector, generation, assignment, query)
+                elseif query.ok then
+                    changeVideo(connector, generation, assignment, socketPath)
+                elseif query.notConnectable then
+                    if isOwnedSocket(socketPath, directory) then
+                        noctalia.removeFile(socketPath)
+                    end
+                    processFallback(connector, generation, socketPath, function()
+                        launchVideo(connector, generation, assignment)
+                    end)
+                else
+                    setLiveError(connector, generation, query.error)
+                end
+            end)
+        else
+            if socketPath then
                 processFallback(connector, generation, socketPath, function()
                     launchVideo(connector, generation, assignment)
                 end)
             else
-                setLiveError(connector, generation, query.error)
+                launchVideo(connector, generation, assignment)
+            end
+        end
+    end
+
+    if not (cachedStill and noctalia.fileExists(cachedStill)) then
+        local live = runtime[connector]
+        runtime[connector] = { status = "starting", socket_path = live and live.socket_path }
+        publishRuntime()
+        ensureStill(validPath, function(stillFile)
+            if not isCurrent(connector, generation) or videoTarget[connector] ~= validPath then
+                return
+            end
+            if stillFile then
+                noctalia.setWallpaper(connector, stillFile)
+                assignment.preview_path = stillFile
+                local current = assignments[connector]
+                if current and current.kind == "video" and current.path == validPath then
+                    current.preview_path = stillFile
+                    saveAssignments()
+                    publishAssignments()
+                end
             end
         end)
+        launchSequence()
     else
-        if socketPath then
-            processFallback(connector, generation, socketPath, function()
-                launchVideo(connector, generation, assignment)
-            end)
-        else
-            launchVideo(connector, generation, assignment)
-        end
+        launchSequence()
     end
     return true
 end
@@ -1174,6 +1462,7 @@ local function assignImage(connector, path)
         return false, pathError
     end
 
+    videoTarget[connector] = nil
     local generation = nextGeneration(connector)
     local previous = assignments[connector]
     noctalia.setWallpaper(connector, validPath)
@@ -1252,6 +1541,7 @@ local function restoreConnector(connector)
     end
 
     local generation = nextGeneration(connector)
+    videoTarget[connector] = nil
     local previous = assignments[connector]
     assignments[connector] = nil
     local saved, saveError = saveAssignments()
@@ -1478,6 +1768,23 @@ local function runModelChecks()
     })
     assert(table.concat(pauseTargets, ",") == "DP-1,eDP-1", "All pause targeted non-video outputs")
     assert(table.concat(ownedConnectors({ ["DP-1"] = {} }, { ["DP-3"] = {} }), ",") == "DP-1,DP-3", "teardown omitted durable output")
+
+    local slides = { { path = "/w/a.jpg" }, { path = "/w/b.jpg" }, { path = "/w/c.jpg" } }
+    assert(nextSlide(slides, "/w/a.jpg", false).path == "/w/b.jpg", "slideshow did not advance")
+    assert(nextSlide(slides, "/w/c.jpg", false).path == "/w/a.jpg", "slideshow did not wrap")
+    assert(nextSlide(slides, "/w/missing.jpg", false).path == "/w/a.jpg", "unknown current did not start at first")
+    assert(nextSlide(slides, "/w/b.jpg", true, function(limit) return limit end).path == "/w/c.jpg"
+        and nextSlide(slides, "/w/b.jpg", true, function() return 1 end).path == "/w/a.jpg", "shuffle repeated or skipped items")
+    assert(nextSlide({}, "/w/a.jpg", false) == nil, "empty slideshow list returned an item")
+    assert(validateCommand({ nonce = 1, action = "set-slideshow", target = "*", interval_sec = 300, shuffle = false }), "valid slideshow command rejected")
+    assert(not validateCommand({ nonce = 1, action = "set-slideshow", target = "*", interval_sec = 7, shuffle = false })
+        and not validateCommand({ nonce = 1, action = "set-slideshow", target = "*", interval_sec = 60, shuffle = "yes" }), "invalid slideshow command accepted")
+
+    local testStill = stillPathFor("/tmp/video.mp4")
+    assert(testStill and testStill:match("/still%-[0-9a-f]+%.jpg$") ~= nil, "stillPathFor failed")
+    local cmd = stillCommand("/tmp/a'b.mp4", "/tmp/out.jpg")
+    assert(cmd:find("multifilesink", 1, true) ~= nil and cmd:find("quality=95", 1, true) ~= nil, "stillCommand missing multifilesink or quality=95")
+    assert(cmd:find("'/tmp/a'\\''b.mp4'", 1, true) ~= nil, "stillCommand shell quoting failed")
 end
 
 local function publishSelfTest(report)
@@ -1495,7 +1802,7 @@ local function runSelfTest(quiet)
     local ok, message = pcall(runModelChecks)
     local report = {
         passed = ok,
-        checks = 22,
+        checks = 32,
         error = not ok and tostring(message) or nil,
     }
 
@@ -1509,6 +1816,34 @@ local function runSelfTest(quiet)
         end
     end
     return report
+end
+
+local function advanceSlide(connector)
+    local assignment = assignments[connector]
+    if not assignment then
+        return false, "output has no wallpaper to rotate"
+    end
+    local config = slideshow[connector]
+    local shuffle = config and config.shuffle or false
+    local pick = nextSlide(mediaSiblings(assignment.path, assignment.kind), assignment.path, shuffle)
+    if not pick then
+        return false, "no sibling media found"
+    end
+    if pick.path == assignment.path then
+        completeRequest(connector, true)
+        return true
+    end
+    local ok, message
+    if assignment.kind == "image" then
+        ok, message = assignImage(connector, pick.path)
+    else
+        local preview = pick.thumbnail and noctalia.fileExists(pick.thumbnail) and pick.thumbnail or nil
+        ok, message = assignVideo(connector, pick.path, preview)
+    end
+    if ok and config then
+        slideshowNextAt[connector] = noctalia.nowMs() + config.interval_sec * 1000
+    end
+    return ok, message
 end
 
 local function handleCommand(command)
@@ -1531,6 +1866,47 @@ local function handleCommand(command)
     end
 
     local connectors = detectedConnectors()
+
+    if command.action == "set-slideshow" then
+        local results = {}
+        local changed = false
+        for _, connector in ipairs(targetsFor(command.target, connectors)) do
+            if command.interval_sec == 0 then
+                if slideshow[connector] then
+                    slideshow[connector] = nil
+                    slideshowNextAt[connector] = nil
+                    changed = true
+                end
+                results[connector] = { ok = true }
+            elseif not connectorDetected(connector) then
+                results[connector] = { ok = false, error = "output is not connected" }
+            elseif not assignments[connector] then
+                if command.target ~= "*" then
+                    results[connector] = { ok = false, error = "output has no wallpaper to rotate" }
+                end
+            else
+                slideshow[connector] = { interval_sec = command.interval_sec, shuffle = command.shuffle }
+                slideshowNextAt[connector] = noctalia.nowMs() + command.interval_sec * 1000
+                changed = true
+                results[connector] = { ok = true }
+            end
+        end
+        if changed then
+            local saved, saveError = saveSlideshow()
+            if not saved then
+                for connector, result in pairs(results) do
+                    result.ok = false
+                    result.error = saveError
+                end
+            end
+            publishSlideshow()
+        end
+        local record = { nonce = command.nonce, action = command.action, results = results }
+        record.summary = summarizeResults(results)
+        noctalia.state.set("command_result", record)
+        return true
+    end
+
     local target = command.action == "restore-all" and "*" or command.target
     local targets = commandTargets(command.action, target, connectors, assignments)
     local batch = { nonce = command.nonce, action = command.action, results = {} }
@@ -1552,10 +1928,25 @@ local function handleCommand(command)
                 ok, message = setPlayback(connector, "paused")
             elseif command.action == "resume" then
                 ok, message = setPlayback(connector, "playing")
+            elseif command.action == "next" then
+                ok, message = advanceSlide(connector)
             else
                 ok, message = restoreConnector(connector)
             end
 
+            if ok then
+                local config = slideshow[connector]
+                if command.action == "restore" or command.action == "restore-all" then
+                    if config then
+                        slideshow[connector] = nil
+                        slideshowNextAt[connector] = nil
+                        saveSlideshow()
+                        publishSlideshow()
+                    end
+                elseif config and (command.action == "assign-image" or command.action == "assign-video" or command.action == "next") then
+                    slideshowNextAt[connector] = noctalia.nowMs() + config.interval_sec * 1000
+                end
+            end
             if not ok then
                 activeRequests[connector] = nil
                 batch.results[connector] = { ok = false, error = message }
@@ -1570,9 +1961,83 @@ local function handleCommand(command)
     return true
 end
 
-function onIpc(event, _payload)
+local ipcNonce = 0
+local function nextIpcNonce()
+    ipcNonce = ipcNonce + 1
+    return math.max(noctalia.nowMs() * 1000 + ipcNonce, lastHandledNonce + 1)
+end
+
+function onIpc(event, payload)
     if event == "self-test" then
         runSelfTest(false)
+    elseif event == "slideshow" then
+        local interval = tonumber(payload) or 0
+        local shuffle = false
+        handleCommand({
+            nonce = nextIpcNonce(),
+            action = "set-slideshow",
+            target = "*",
+            interval_sec = interval,
+            shuffle = shuffle,
+        })
+    elseif event == "slideshow-shuffle" then
+        local interval = tonumber(payload) or 0
+        handleCommand({
+            nonce = nextIpcNonce(),
+            action = "set-slideshow",
+            target = "*",
+            interval_sec = interval,
+            shuffle = true,
+        })
+    elseif event == "next" then
+        local target = (type(payload) == "string" and payload ~= "") and payload or "*"
+        handleCommand({
+            nonce = nextIpcNonce(),
+            action = "next",
+            target = target,
+        })
+    elseif event == "pause" then
+        local target = (type(payload) == "string" and payload ~= "") and payload or "*"
+        local action = "pause"
+        if target == "*" then
+            local anyPlaying = false
+            for _, c in ipairs(detectedConnectors()) do
+                if assignments[c] and assignments[c].kind == "video" then
+                    local live = runtime[c]
+                    if not live or live.status ~= "paused" then
+                        anyPlaying = true
+                        break
+                    end
+                end
+            end
+            if not anyPlaying then
+                action = "resume"
+            end
+        else
+            local live = runtime[target]
+            if live and live.status == "paused" then
+                action = "resume"
+            end
+        end
+        handleCommand({
+            nonce = nextIpcNonce(),
+            action = action,
+            target = target,
+        })
+    elseif event == "resume" then
+        local target = (type(payload) == "string" and payload ~= "") and payload or "*"
+        handleCommand({
+            nonce = nextIpcNonce(),
+            action = "resume",
+            target = target,
+        })
+    elseif event == "stop" then
+        local target = (type(payload) == "string" and payload ~= "") and payload or "*"
+        handleCommand({
+            nonce = nextIpcNonce(),
+            action = target == "*" and "restore-all" or "restore",
+            target = target,
+        })
     end
 end
 
@@ -1609,8 +2074,36 @@ function onExit()
     end
 end
 
+local function slideshowTick(now)
+    if next(slideshow) == nil then
+        return
+    end
+    for _, connector in ipairs(detectedConnectors()) do
+        local config = slideshow[connector]
+        if config then
+            if not slideshowNextAt[connector] then
+                slideshowNextAt[connector] = now + config.interval_sec * 1000
+            elseif now >= slideshowNextAt[connector] then
+                -- Re-arm first so a failed switch cannot retry on every tick.
+                slideshowNextAt[connector] = now + config.interval_sec * 1000
+                local assignment = assignments[connector]
+                local live = runtime[connector]
+                local paused = assignment and assignment.kind == "video"
+                    and (assignment.desired_playback == "paused" or (live and live.status == "paused"))
+                if assignment and not paused and not connectorBusy(connector) and not activeRequests[connector] then
+                    local ok, message = advanceSlide(connector)
+                    if not ok then
+                        noctalia.log("Slideshow could not change " .. connector .. ": " .. tostring(message))
+                    end
+                end
+            end
+        end
+    end
+end
+
 function update()
     local now = noctalia.nowMs()
+    slideshowTick(now)
     for connector, operation in pairs(pending) do
         if not isCurrent(connector, operation.generation) then
             clearPending(connector, operation)
@@ -1654,7 +2147,13 @@ end
 
 noctalia.setUpdateInterval(1000)
 assignments = loadAssignments()
+pruneStills(assignments)
 publishAssignments()
+slideshow = loadSlideshow()
+for connector, config in pairs(slideshow) do
+    slideshowNextAt[connector] = noctalia.nowMs() + config.interval_sec * 1000
+end
+publishSlideshow()
 capabilitiesReady = restoreConnectedAssignments
 if type(noctalia.commandExists) == "function" then
     restartSettingsSignature = settingsSignature()
@@ -1666,6 +2165,7 @@ if type(noctalia.commandExists) == "function" then
 end
 
 return {
+    nextSlide = nextSlide,
     assignments = assignments,
     runtime = runtime,
     detectedConnectors = detectedConnectors,
@@ -1696,4 +2196,9 @@ return {
     fnv1a32 = fnv1a32,
     validMediaRoot = validMediaRoot,
     requiredFlags = REQUIRED_FLAGS,
+    stillPathFor = stillPathFor,
+    ensureStill = ensureStill,
+    pruneStills = pruneStills,
+    onIpc = onIpc,
+    advanceSlide = advanceSlide,
 }
