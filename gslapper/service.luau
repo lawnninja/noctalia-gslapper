@@ -1379,8 +1379,6 @@ local function assignVideo(connector, path, previewPath, desiredPlayback)
         preview_path = initialStill,
         desired_playback = desiredPlayback == "paused" and "paused" or "playing",
     }
-    
-    noctalia.setWallpaperEnabled(connector, true)
     if initialStill then
         noctalia.setWallpaper(connector, initialStill)
     end
@@ -1442,8 +1440,8 @@ local function assignVideo(connector, path, previewPath, desiredPlayback)
                     publishAssignments()
                 end
             end
+            launchSequence()
         end)
-        launchSequence()
     else
         launchSequence()
     end
