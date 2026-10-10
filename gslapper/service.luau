@@ -1202,6 +1202,7 @@ local function commitVideo(connector, generation, assignment, query)
     end
 
     clearPending(connector)
+    noctalia.setWallpaperEnabled(connector, false)
     runtime[connector] = {
         status = query.status,
         error = nil,
@@ -1379,6 +1380,7 @@ local function assignVideo(connector, path, previewPath, desiredPlayback)
         preview_path = initialStill,
         desired_playback = desiredPlayback == "paused" and "paused" or "playing",
     }
+    noctalia.setWallpaperEnabled(connector, true)
     if initialStill then
         noctalia.setWallpaper(connector, initialStill)
     end
@@ -1437,6 +1439,11 @@ local function assignVideo(connector, path, previewPath, desiredPlayback)
                     current.preview_path = stillFile
                     saveAssignments()
                     publishAssignments()
+                    
+                    local live = runtime[connector]
+                    if live and (live.status == "playing" or live.status == "paused") then
+                        noctalia.setWallpaperEnabled(connector, false)
+                    end
                 end
             end
         end)
