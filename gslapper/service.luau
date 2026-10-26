@@ -2081,7 +2081,7 @@ local function slideshowTick(now)
     end
     for _, connector in ipairs(detectedConnectors()) do
         local config = slideshow[connector]
-        if config then
+        if config and (config.interval_sec or 0) > 0 then
             if not slideshowNextAt[connector] then
                 slideshowNextAt[connector] = now + config.interval_sec * 1000
             elseif now >= slideshowNextAt[connector] then
@@ -2152,7 +2152,9 @@ pruneStills(assignments)
 publishAssignments()
 slideshow = loadSlideshow()
 for connector, config in pairs(slideshow) do
-    slideshowNextAt[connector] = noctalia.nowMs() + config.interval_sec * 1000
+    if config and (config.interval_sec or 0) > 0 then
+        slideshowNextAt[connector] = noctalia.nowMs() + config.interval_sec * 1000
+    end
 end
 publishSlideshow()
 capabilitiesReady = restoreConnectedAssignments

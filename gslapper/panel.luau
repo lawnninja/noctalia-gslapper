@@ -695,24 +695,26 @@ function onSlideshowShuffle()
     sendCommand("set-slideshow", nil, { interval_sec = interval_sec, shuffle = not shuffle })
 end
 
-local function slideshowStrip(connectors)
+local function controlStrip(connectors)
     if #connectors == 0 then return nil end
+
+    local targetConnectors = selectedOutput == "*" and connectors or { selectedOutput }
     local hasAssignment = false
-    for _, c in ipairs(connectors) do
+    for _, c in ipairs(targetConnectors) do
         if assignments[c] then hasAssignment = true break end
     end
-    
+
     local firstInterval = nil
     local hasMixed = false
     local shuffle = true
-    for _, c in ipairs(connectors) do
+    for _, c in ipairs(targetConnectors) do
         local entry = slideshow[c] or {}
         local cInterval = entry.interval_sec or 0
         if firstInterval == nil then firstInterval = cInterval
         elseif firstInterval ~= cInterval then hasMixed = true end
         if not entry.shuffle then shuffle = false end
     end
-    
+
     local options = {}
     local selectedIndex = 0
     if hasMixed then
@@ -727,77 +729,102 @@ local function slideshowStrip(connectors)
         end
     end
 
-    return ui.row({ align="center", gap=8, padding=9, radius=9, fill="surface_variant/0.40" }, {
-        ui.glyph({ name="clock-play", color="primary", size=18 }),
-        ui.label({ text=tr("panel.slideshow"), flexGrow=1 }),
-        ui.button({ glyph="arrows-shuffle", variant="ghost", selected=shuffle,
-                    tooltip=tr("panel.shuffle"), enabled=hasAssignment, onClick="onSlideshowShuffle" }),
-        ui.select({ options=options, selectedIndex=selectedIndex, width=170,
-                    enabled=hasAssignment, onChange="onSlideshowChanged" }),
-    })
-end
+    local items = {}
 
-local function activeStrip(connectors)
     if selectedOutput == "*" then
         local counts = mixedCounts(assignments, connectors)
         local playbackAction = videoPlaybackAction(assignments, runtime, connectors)
-        return ui.row({ align = "center", gap = 8, padding = 9, radius = 9, fill = "surface_variant/0.40" }, {
-            ui.glyph({ name = "devices", color = "primary", size = 18 }),
-            ui.label({
-                text = tr("panel.mixed_summary", {
-                    outputs = #connectors,
-                    videos = counts.video,
-                    images = counts.image,
+        table.insert(items, ui.glyph({ name = "devices", color = "primary", size = 18 }))
+        table.insert(items, ui.label({
+            text = tr("panel.mixed_summary", {
+                outputs = #connectors,
+                videos = counts.video,
+                images = counts.image,
+            }),
+            flexGrow = 1,
+            maxLines = 1,
+        }))
+        table.insert(items, ui.button({
+            text = tr(playbackAction == "resume" and "panel.resume_videos" or "panel.pause_videos"),
+            variant = "ghost",
+            enabled = counts.video > 0 and not selectionBusy(),
+            onClick = function() sendCommand(playbackAction) end,
+        }))
+        table.insert(items, ui.button({
+            text = tr("panel.restore_all"),
+            variant = "ghost",
+            enabled = #connectors > 0 and not selectionBusy(),
+            onClick = function() sendCommand("restore-all") end,
+        }))
+    else
+        local assignment = assignments[selectedOutput]
+        local live = runtime[selectedOutput]
+        local isVideo = assignment and assignment.kind == "video"
+        local paused = live and live.status == "paused"
+
+        if assignment then
+            table.insert(items, ui.glyph({
+                name = isVideo and "movie" or "photo",
+                color = isVideo and "secondary" or "primary",
+                size = 18,
+            }))
+            table.insert(items, ui.column({ flexGrow = 1, gap = 2 }, {
+                ui.label({ text = assignment.path:match("([^/]+)$") or assignment.path, fontWeight = "bold", maxLines = 1 }),
+                ui.label({
+                    text = live and tr("panel.status_" .. tostring(live.status)) or tr("panel.status_static"),
+                    fontSize = 10,
+                    color = live and live.error and "error" or "on_surface_variant",
                 }),
-                flexGrow = 1,
-                maxLines = 1,
-            }),
-            ui.button({
-                text = tr(playbackAction == "resume" and "panel.resume_videos" or "panel.pause_videos"),
+            }))
+            if isVideo then
+                table.insert(items, ui.button({
+                    text = tr(paused and "panel.resume" or "panel.pause"),
+                    variant = "ghost",
+                    enabled = live ~= nil and not selectionBusy(),
+                    onClick = function() sendCommand(paused and "resume" or "pause") end,
+                }))
+            end
+            table.insert(items, ui.button({
+                text = tr("panel.restore"),
                 variant = "ghost",
-                enabled = counts.video > 0 and not selectionBusy(),
-                onClick = function() sendCommand(playbackAction) end,
-            }),
-            ui.button({
-                text = tr("panel.restore_all"),
-                variant = "ghost",
-                enabled = #connectors > 0 and not selectionBusy(),
-                onClick = function() sendCommand("restore-all") end,
-            }),
-        })
+                enabled = not selectionBusy(),
+                onClick = function() sendCommand("restore") end,
+            }))
+        else
+            table.insert(items, ui.glyph({
+                name = "photo",
+                color = "on_surface_variant",
+                size = 18,
+            }))
+            table.insert(items, ui.column({ flexGrow = 1, gap = 2 }, {
+                ui.label({ text = selectedOutput, fontWeight = "bold", maxLines = 1 }),
+                ui.label({
+                    text = tr("panel.status_static"),
+                    fontSize = 10,
+                    color = "on_surface_variant",
+                }),
+            }))
+        end
     end
 
-    local assignment = assignments[selectedOutput]
-    local live = runtime[selectedOutput]
-    if not assignment then
-        return nil
-    end
-    local isVideo = assignment.kind == "video"
-    local paused = live and live.status == "paused"
-    return ui.row({ align = "center", gap = 8, padding = 9, radius = 9, fill = "surface_variant/0.40" }, {
-        ui.glyph({ name = isVideo and "movie" or "photo", color = isVideo and "secondary" or "primary", size = 18 }),
-        ui.column({ flexGrow = 1, gap = 2 }, {
-            ui.label({ text = assignment.path:match("([^/]+)$") or assignment.path, fontWeight = "bold", maxLines = 1 }),
-            ui.label({
-                text = live and tr("panel.status_" .. tostring(live.status)) or tr("panel.status_static"),
-                fontSize = 10,
-                color = live and live.error and "error" or "on_surface_variant",
-            }),
-        }),
-        ui.button({
-            text = tr(paused and "panel.resume" or "panel.pause"),
-            variant = "ghost",
-            visible = isVideo,
-            enabled = live ~= nil and not selectionBusy(),
-            onClick = function() sendCommand(paused and "resume" or "pause") end,
-        }),
-        ui.button({
-            text = tr("panel.restore"),
-            variant = "ghost",
-            enabled = not selectionBusy(),
-            onClick = function() sendCommand("restore") end,
-        }),
-    })
+    table.insert(items, ui.glyph({ name = "clock-play", color = "primary", size = 18 }))
+    table.insert(items, ui.button({
+        glyph = "arrows-shuffle",
+        variant = "ghost",
+        selected = shuffle,
+        tooltip = tr("panel.shuffle"),
+        enabled = hasAssignment,
+        onClick = "onSlideshowShuffle",
+    }))
+    table.insert(items, ui.select({
+        options = options,
+        selectedIndex = selectedIndex,
+        width = 150,
+        enabled = hasAssignment,
+        onChange = "onSlideshowChanged",
+    }))
+
+    return ui.row({ align = "center", gap = 8, padding = 9, radius = 9, fill = "surface_variant/0.40" }, items)
 end
 
 local function resultBanner()
@@ -907,10 +934,8 @@ render = function()
             maxLines = 2,
         }))
     end
-    local active = activeStrip(connectors)
-    if active then table.insert(children, active) end
-    local slide = slideshowStrip(connectors)
-    if slide then table.insert(children, slide) end
+    local controls = controlStrip(connectors)
+    if controls then table.insert(children, controls) end
     local result = resultBanner()
     if result then table.insert(children, result) end
 
